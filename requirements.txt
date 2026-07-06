@@ -1,0 +1,7 @@
+PyQt5==5.15.9
+pyqt5-tools==5.15.4.3.2
+qtawesome==1.2.3
+pydantic==2.4.2
+python-dotenv==1.0.0
+openpyxl==3.10.10
+python-docx==0.8.11
