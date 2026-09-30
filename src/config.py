@@ -6,7 +6,30 @@ from enum import Enum
 
 # Пути
 BASE_DIR = Path(__file__).parent.parent
-DATA_DIR = Path(os.environ.get("SECURE_SHELL_DATA_DIR", str(Path.home() / ".secure-shell"))).expanduser().resolve()
+
+# Совместимость с настройками и каталогом данных предыдущих выпусков.
+LEGACY_DATA_DIR_ENV = "SECURE_SHELL_DATA_DIR"
+LEGACY_DATA_DIRECTORY = ".secure-shell"
+LEGACY_DATABASE_FILENAME = "secure_shell.db"
+
+
+def resolve_data_dir(environ=None, home=None):
+    """Сохранять существующие аккаунты при смене названия приложения."""
+    environ = os.environ if environ is None else environ
+    configured = environ.get("VUAL_DATA_DIR") or environ.get(LEGACY_DATA_DIR_ENV)
+    if configured:
+        return Path(configured).expanduser().resolve()
+    home = Path.home() if home is None else Path(home)
+    current = home / ".vual"
+    legacy = home / LEGACY_DATA_DIRECTORY
+    database_names = ("users.db", LEGACY_DATABASE_FILENAME)
+    if not any((current / name).is_file() for name in database_names):
+        if any((legacy / name).is_file() for name in database_names):
+            return legacy.resolve()
+    return current.resolve()
+
+
+DATA_DIR = resolve_data_dir()
 RESOURCES_DIR = BASE_DIR / "resources"
 LOGS_DIR = DATA_DIR / "logs"
 
@@ -18,14 +41,14 @@ LOGS_DIR.mkdir(exist_ok=True)
 DB_PATH = DATA_DIR / "users.db"
 TABLES_DB_PATH = DATA_DIR / "tables.db"
 DOCUMENTS_DB_PATH = DATA_DIR / "documents.db"
-LEGACY_DB_PATH = DATA_DIR / "secure_shell.db"
+LEGACY_DB_PATH = DATA_DIR / LEGACY_DATABASE_FILENAME
 
 # Логирование
 AUDIT_LOG_PATH = DATA_DIR / "audit.log"
 APP_LOG_PATH = LOGS_DIR / "app.log"
 
 # Интерфейс
-APP_TITLE = "Secure Shell - Защищённая оболочка"
+APP_TITLE = "Вуаль — Защищённая оболочка"
 WINDOW_WIDTH = 1200
 WINDOW_HEIGHT = 800
 DEFAULT_THEME = "light"  # light или dark

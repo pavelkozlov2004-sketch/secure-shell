@@ -14,6 +14,9 @@ from auth.password_utils import PasswordUtils
 from config import DATA_DIR
 
 ALPHABET = string.digits + string.punctuation
+RECOVERY_FORMAT = 'VualRecovery-v1'
+# Старые резервные файлы используют своё имя формата как AES-GCM associated data.
+LEGACY_RECOVERY_FORMAT = 'SecureShellRecovery-v1'
 
 
 def generate_password():
@@ -31,8 +34,8 @@ def encrypt_vault(data, phrase):
     if not isinstance(phrase, str) or len(phrase) < 12:
         raise ValueError('Парольная фраза резервного файла: минимум 12 символов.')
     salt, nonce = secrets.token_bytes(16), secrets.token_bytes(12)
-    encrypted = AESGCM(_key(phrase, salt)).encrypt(nonce, json.dumps(data, ensure_ascii=False).encode(), b'SecureShellRecovery-v1')
-    return json.dumps({'format': 'SecureShellRecovery-v1',
+    encrypted = AESGCM(_key(phrase, salt)).encrypt(nonce, json.dumps(data, ensure_ascii=False).encode(), RECOVERY_FORMAT.encode('ascii'))
+    return json.dumps({'format': RECOVERY_FORMAT,
                        'salt': base64.b64encode(salt).decode(),
                        'nonce': base64.b64encode(nonce).decode(),
                        'ciphertext': base64.b64encode(encrypted).decode()}, indent=2).encode()
@@ -47,16 +50,17 @@ def decrypt_vault(path, phrase):
         if len(raw) > 4 * 1024 * 1024:
             raise ValueError('Слишком большой резервный файл')
         envelope = json.loads(raw)
-        if envelope['format'] != 'SecureShellRecovery-v1':
+        vault_format = envelope['format']
+        if vault_format not in (RECOVERY_FORMAT, LEGACY_RECOVERY_FORMAT):
             raise ValueError('Неизвестный формат')
         salt = base64.b64decode(envelope['salt'], validate=True)
         nonce = base64.b64decode(envelope['nonce'], validate=True)
         if len(salt) != 16 or len(nonce) != 12:
             raise ValueError('Неверный формат')
         ciphertext = base64.b64decode(envelope['ciphertext'], validate=True)
-        clear = AESGCM(_key(phrase, salt)).decrypt(nonce, ciphertext, b'SecureShellRecovery-v1')
+        clear = AESGCM(_key(phrase, salt)).decrypt(nonce, ciphertext, vault_format.encode('ascii'))
         result = json.loads(clear)
-        if not isinstance(result.get('accounts'), list):
+        if not isinstance(result, dict) or not isinstance(result.get('accounts'), list):
             raise ValueError('Неверное содержимое')
         return result
     except (InvalidTag, KeyError, TypeError, ValueError) as exc:

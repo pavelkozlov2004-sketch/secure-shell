@@ -242,3 +242,30 @@ class LoginManager:
             return False
         self.audit_logger.log_action(actor.id, 'UPDATE_USER', f'ID={user_id}')
         return True
+
+    def reactivate_user(self, user_id):
+        """Восстановить аккаунт, сохранив пароль и завершив прежние сеансы."""
+        actor = self._admin()
+        if not actor:
+            return False
+        with self.db.get_cursor() as cursor:
+            cursor.execute('BEGIN IMMEDIATE')
+            authorized = self._transaction_user(cursor, admin=True)
+            if not authorized or authorized['id'] != actor.id:
+                return False
+            target = cursor.execute('SELECT login FROM users WHERE id=? '
+                                    'AND (active=0 OR network_blocked=1)', (user_id,)).fetchone()
+            if not target:
+                return False
+            cursor.execute('UPDATE users SET active=1,network_blocked=0,updated_at=CURRENT_TIMESTAMP '
+                           'WHERE id=? AND (active=0 OR network_blocked=1)', (user_id,))
+            if cursor.rowcount != 1:
+                return False
+            cursor.execute('DELETE FROM login_attempts WHERE login=?', (target['login'],))
+            cursor.execute('DELETE FROM user_sessions WHERE user_id=?', (user_id,))
+            cursor.execute("UPDATE live_sessions SET ended_at=?,end_reason='reactivated' "
+                           'WHERE user_id=? AND ended_at IS NULL', (time.time(), user_id))
+            cursor.execute("INSERT INTO audit_logs(user_id,action,details,session_id) "
+                           "VALUES (?,'REACTIVATE_USER',?,?)",
+                           (actor.id, f'ID={user_id}', self._session_id))
+        return True

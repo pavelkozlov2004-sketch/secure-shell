@@ -1,7 +1,7 @@
 """Окно входа, первоначальной настройки и управления текущим сеансом."""
 import sqlite3
 import time
-from PyQt5.QtCore import Qt, QTimer
+from PyQt5.QtCore import Qt, QTimer, pyqtSignal
 from PyQt5.QtWidgets import (
     QWidget, QVBoxLayout, QFormLayout, QLabel, QLineEdit, QPushButton,
     QStackedWidget, QHBoxLayout, QFrame, QFileDialog, QInputDialog, QMessageBox, QTabWidget,
@@ -18,14 +18,22 @@ from ui.accounts_workspace import AccountsWorkspace
 
 
 class LoginWindow(QWidget):
-    def __init__(self, db_manager):
+    network_settings_requested = pyqtSignal()
+
+    def __init__(self, db_manager, manager=None):
         super().__init__()
         self.db = db_manager
-        self.manager = LoginManager(db_manager)
+        self.manager = manager or LoginManager(db_manager)
+        self.is_remote = bool(getattr(self.manager, 'is_remote', False))
         self.emergency = EmergencyManager(self.manager)
-        self.connectivity = ConnectivityMonitor(self.manager)
+        if self.is_remote:
+            from network.manager import NetworkConnectivityMonitor
+            self.connectivity = NetworkConnectivityMonitor(self.manager)
+        else:
+            self.connectivity = ConnectivityMonitor(self.manager)
         self.connectivity_window = ConnectivityWindow(self.connectivity, self)
         self._next_board = 0
+        self._board_announced = False
         self.setWindowTitle(APP_TITLE)
         self.resize(580, 700)
         self.setMinimumSize(460, 440)
@@ -42,11 +50,19 @@ class LoginWindow(QWidget):
         ''')
         outer = QVBoxLayout(self)
         outer.setContentsMargins(32, 28, 32, 28)
-        heading = QLabel('Secure Shell')
+        heading = QLabel('Вуаль')
         heading.setObjectName('heading')
         outer.addWidget(heading)
         subtitle = QLabel('Вход и управление сеансом')
         outer.addWidget(subtitle)
+        self.network_status = QLabel()
+        self.network_status.setTextFormat(Qt.PlainText)
+        self.network_status.setWordWrap(True)
+        outer.addWidget(self.network_status)
+        self.network_settings_button = QPushButton('Подключение к серверу…')
+        self.network_settings_button.clicked.connect(self.network_settings_requested.emit)
+        outer.addWidget(self.network_settings_button)
+        self._refresh_network_status()
         self.pages = QStackedWidget()
         outer.addWidget(self.pages)
         self._build_login()
@@ -56,7 +72,7 @@ class LoginWindow(QWidget):
         self.timer.setInterval(2000)
         self.timer.timeout.connect(self._refresh_session)
         self.timer.start()
-        if self.db.fetch_one('SELECT 1 FROM users LIMIT 1'):
+        if self.is_remote or self.db.fetch_one('SELECT 1 FROM users LIMIT 1'):
             self.pages.setCurrentWidget(self.login_page)
             self.login_edit.setFocus()
         else:
@@ -175,7 +191,11 @@ class LoginWindow(QWidget):
         self.connections_button = QPushButton('Подключения пользователей…')
         self.connections_button.clicked.connect(self._show_connections)
         emergency_layout.addWidget(self.connections_button)
-        self.connections_status = QLabel('Опрос: каждые 5 минут; ответ: 60 секунд. Табло: каждые 10 минут.')
+        self.connections_status = QLabel(
+            'Проверка локальной сети и обновление состояний: каждые 2 секунды. '
+            'Без сигнала более 10 секунд пользователь отмечается серым.' if self.is_remote else
+            'Состояния обновляются каждые 2 секунды. Зелёный — работает, '
+            'серый — нет подключения, красный — деактивирован.')
         self.connections_status.setWordWrap(True)
         emergency_layout.addWidget(self.connections_status)
         self.emergency_panel.hide()
@@ -233,13 +253,19 @@ class LoginWindow(QWidget):
             else:
                 self.login_status.setText('Вход не выполнен. Проверьте данные; при сетевой блокировке обратитесь к администратору; после трёх ошибок подождите пять минут.')
                 self.password_edit.setFocus()
-        except (sqlite3.Error, OSError):
+        except (sqlite3.Error, OSError, PermissionError):
             self._logout()
-            self.login_status.setText('Не удалось обратиться к базе или журналу. Проверьте доступ к каталогу данных.')
+            self.login_status.setText('Сервер недоступен. Проверьте локальную сеть и параметры подключения.' if self.is_remote else
+                                      'Не удалось обратиться к базе или журналу. Проверьте доступ к каталогу данных.')
+            self._refresh_network_status()
         finally:
             self.login_button.setEnabled(True)
 
     def _setup(self):
+        if self.is_remote:
+            self.setup_status.setText('Первый администратор создаётся на сервере. Войдите в существующий аккаунт.')
+            self.pages.setCurrentWidget(self.login_page)
+            return
         if self.pages.currentWidget() is not self.setup_page:
             return
         if self.setup_password.text() != self.setup_repeat.text():
@@ -259,20 +285,60 @@ class LoginWindow(QWidget):
                 self._clear_secrets()
                 self.pages.setCurrentWidget(self.login_page)
                 self.login_status.setText('Настройка уже выполнена. Войдите в систему.')
-        except (sqlite3.Error, OSError):
+        except (sqlite3.Error, OSError, PermissionError):
             self.setup_status.setText('Не удалось сохранить настройки. Проверьте доступ к каталогу данных.')
         finally:
             self.setup_button.setEnabled(True)
 
+    def _refresh_network_status(self):
+        if not self.is_remote:
+            self.network_status.setText('Работа на этом компьютере')
+            return
+        server = getattr(self.manager, 'server_url', '')
+        error = getattr(self.manager, 'last_error', '')
+        synced = getattr(self.manager, 'last_sync_at', None)
+        text = f'Сервер локальной сети: {server}'
+        if error:
+            text += '\nНет подключения: ' + error
+        elif synced:
+            text += f'\nУчётные записи обновлены: {ConnectivityWindow.stamp(synced)} UTC'
+        else:
+            text += '\nДля проверки подключения войдите в систему.'
+        self.network_status.setText(text)
+
     def _refresh_session(self):
+        self._refresh_network_status()
         if self.pages.currentWidget() is not self.session_page:
             return
         try:
+            if self.is_remote and not self.manager.refresh_session():
+                self._logout()
+                self.login_status.setText('Сеанс завершён: сервер недоступен или доступ отозван. Войдите повторно.')
+                self._refresh_network_status()
+                return
             user = self.manager.current_user
             if user is None:
                 self._logout()
                 self.login_status.setText('Сеанс завершён: учётная запись недоступна.')
                 return
+            if not self.is_remote:
+                self.connectivity.respond()
+            if user.is_admin:
+                self.connectivity.poll()
+                if self.connectivity_window.isVisible():
+                    self._show_connections(automatic=True)
+                elif time.monotonic() >= self._next_board:
+                    self._show_connections(automatic=True)
+                if self.pages.currentWidget() is not self.session_page:
+                    return
+            if self.is_remote:
+                user = self.manager.current_user
+                if user is None:
+                    self._logout()
+                    self.login_status.setText('Сеанс завершён: доступ отозван или сервер недоступен.')
+                    return
+            if not user.is_admin:
+                self.connectivity_window.clear_session()
             self.file_workspace.validate_session()
             self.database_workspace.validate_session()
             self.accounts_workspace.validate_session()
@@ -280,35 +346,31 @@ class LoginWindow(QWidget):
                 self.session_tabs.indexOf(self.accounts_workspace), user.is_admin)
             self.report_table.validate_session()
             self.file_workspace.register_button.setVisible(user.is_admin)
-            self.connectivity.respond()
-            if user.is_admin:
-                self.connectivity.poll()
-                if time.monotonic() >= self._next_board:
-                    self._show_connections(automatic=True)
-            else:
-                self.connectivity_window.hide()
-                self.connectivity_window.table.setRowCount(0)
             self.emergency_panel.setVisible(user.is_admin)
-            if user.is_admin:
+            if user.is_admin and not self.is_remote:
+                self.prepare_button.setEnabled(True)
                 ready, message = self.emergency.status()
                 self.emergency_status.setText(message)
                 self.compromise_button.setEnabled(ready)
             else:
+                self.prepare_button.setEnabled(False)
                 self.compromise_button.setEnabled(False)
+                self.emergency_status.setText('Резервные пароли управляются на сервере.' if self.is_remote else '')
+            self._refresh_network_status()
             direction = self.db.fetch_one('SELECT name FROM directions WHERE id=?', (user.direction_id,))
             level = self.db.fetch_one('SELECT name FROM secrecy_levels WHERE id=?', (user.secrecy_level_id,))
             self.identity_label.setText(
                 f'Пользователь: {user.login}\nРоль: {"Администратор" if user.is_admin else "Пользователь"}'
                 f'\nНаправление: {direction[0] if direction else "—"}'
                 f'\nУровень доступа: {level[0] if level else "—"}')
-        except (sqlite3.Error, OSError):
+        except (sqlite3.Error, OSError, PermissionError):
             self._logout()
             self.login_status.setText('Сеанс завершён: не удалось проверить права доступа.')
 
     def _change_password(self):
         try:
             user = self.manager.current_user
-        except (sqlite3.Error, OSError):
+        except (sqlite3.Error, OSError, PermissionError):
             self._logout()
             self.login_status.setText("Не удалось проверить сеанс. Войдите повторно.")
             return
@@ -323,7 +385,7 @@ class LoginWindow(QWidget):
             ok = self.manager.change_password(user.id, self.old_password.text(), self.new_password.text())
             self._clear_secrets()
             self.session_status.setText('Пароль изменён.' if ok else 'Проверьте текущий пароль и длину нового: от 8 до 1024 символов.')
-        except (sqlite3.Error, OSError):
+        except (sqlite3.Error, OSError, PermissionError):
             self._clear_secrets()
             self.session_status.setText('Не удалось завершить операцию. Проверьте базу и журнал.')
         finally:
@@ -331,15 +393,22 @@ class LoginWindow(QWidget):
 
     def _show_connections(self, checked=False, automatic=False):
         try:
-            rows = self.connectivity.offline_users()
+            rows = self.connectivity.user_statuses()
             self.connectivity_window.display(rows)
             self._next_board = time.monotonic() + BOARD_SECONDS
-            if rows or not automatic:
+            disconnected = any(row['status_code'] != 'online' for row in rows)
+            if not automatic or (disconnected and not self._board_announced):
                 self.connectivity_window.show()
+                self._board_announced = True
         except PermissionError:
-            self.connectivity_window.hide()
+            self.connectivity_window.clear_session()
         except (sqlite3.Error, OSError):
-            self.connections_status.setText('Не удалось обновить подключения: проверьте доступ к базе.')
+            self.connectivity_window.clear_session()
+            self.connections_status.setText('Не удалось обновить подключения: проверьте сервер и локальную сеть.' if self.is_remote else
+                                            'Не удалось обновить подключения: проверьте доступ к базе.')
+            if self.is_remote:
+                self._logout()
+                self.login_status.setText('Нет подключения к серверу. Войдите повторно после восстановления сети.')
 
     def _logout(self):
         self.file_workspace.clear_session()
@@ -348,12 +417,12 @@ class LoginWindow(QWidget):
         self.session_tabs.setTabVisible(self.session_tabs.indexOf(self.accounts_workspace), False)
         self.report_table.clear_session()
         self.session_tabs.setCurrentIndex(0)
-        self.connectivity_window.hide()
-        self.connectivity_window.table.setRowCount(0)
+        self.connectivity_window.clear_session()
         self._next_board = 0
+        self._board_announced = False
         try:
             self.manager.logout()
-        except (sqlite3.Error, OSError):
+        except (sqlite3.Error, OSError, PermissionError):
             pass  # Менеджер очищает сеанс до записи события выхода.
         self._clear_secrets()
         self.identity_label.clear()
@@ -363,6 +432,8 @@ class LoginWindow(QWidget):
         self.password_edit.setFocus()
 
     def _prepare_emergency(self):
+        if self.is_remote:
+            return
         user = self.manager.current_user
         if not user or not user.is_admin:
             self._refresh_session()
@@ -378,7 +449,7 @@ class LoginWindow(QWidget):
             QMessageBox.warning(self, 'Резервные пароли', 'Парольные фразы не совпадают.')
             return
         path, _ = QFileDialog.getSaveFileName(self, 'Сохранить новый резервный файл',
-                                             'SecureShell-recovery.json', 'Зашифрованный файл (*.json)')
+                                             'Вуаль-резервные-пароли.json', 'Зашифрованный файл (*.json)')
         if not path:
             return
         self.prepare_button.setEnabled(False)
@@ -395,6 +466,8 @@ class LoginWindow(QWidget):
             self._refresh_session()
 
     def _compromise(self):
+        if self.is_remote:
+            return
         ready, message = self.emergency.status()
         if not ready:
             QMessageBox.warning(self, 'Компрометация', message)

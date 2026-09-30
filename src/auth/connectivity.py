@@ -4,7 +4,8 @@ import uuid
 
 POLL_SECONDS = 300
 RESPONSE_SECONDS = 60
-BOARD_SECONDS = 600
+LAN_RESPONSE_SECONDS = 10
+BOARD_SECONDS = 2
 
 
 class ConnectivityMonitor:
@@ -49,7 +50,8 @@ class ConnectivityMonitor:
                 'SELECT DISTINCT s.user_id FROM connectivity_challenges q '
                 'JOIN live_sessions s ON s.id=q.session_id JOIN users u ON u.id=s.user_id '
                 'WHERE q.answered_at IS NULL AND q.resolved_at IS NULL AND q.deadline<=? '
-                'AND s.ended_at IS NULL AND u.active=1 AND u.is_admin=0 AND u.network_blocked=0',
+                'AND s.ended_at IS NULL AND u.active=1 AND u.is_admin=0 AND u.network_blocked=0 '
+                'AND NOT EXISTS(SELECT 1 FROM lan_presence p WHERE p.session_id=s.id)',
                 (now,)).fetchall()
             for row in expired:
                 uid = row['user_id']
@@ -67,7 +69,8 @@ class ConnectivityMonitor:
             if state is None or state['next_poll'] <= now:
                 sessions = c.execute('SELECT s.id FROM live_sessions s JOIN users u ON u.id=s.user_id '
                                      'WHERE s.ended_at IS NULL AND u.active=1 AND u.is_admin=0 '
-                                     'AND u.network_blocked=0').fetchall()
+                                     'AND u.network_blocked=0 AND NOT EXISTS '
+                                     '(SELECT 1 FROM lan_presence p WHERE p.session_id=s.id)').fetchall()
                 for session in sessions:
                     c.execute('INSERT INTO connectivity_challenges(session_id,nonce,issued_at,deadline) '
                               'VALUES (?,?,?,?) ON CONFLICT(session_id) DO UPDATE SET '
@@ -78,24 +81,41 @@ class ConnectivityMonitor:
                           'ON CONFLICT(id) DO UPDATE SET next_poll=excluded.next_poll', (now + POLL_SECONDS,))
         return blocked
 
-    def offline_users(self):
+    def user_statuses(self):
+        """Состояние всех аккаунтов; цвет определяется активностью и свежим сигналом."""
         now = self.clock()
         with self.db.get_cursor() as c:
             if not self._actor(c, admin=True):
                 raise PermissionError('Требуется действующий сеанс администратора')
-            users = c.execute('SELECT u.id,u.login,u.active,u.network_blocked,'
+            users = c.execute(
+                'SELECT u.id,u.login,u.active,u.network_blocked,'
                 '(SELECT MAX(started_at) FROM live_sessions WHERE user_id=u.id) AS last_login,'
-                '(SELECT MAX(last_seen_at) FROM live_sessions WHERE user_id=u.id) AS last_seen '
-                'FROM users u WHERE u.id<>? AND NOT EXISTS '
-                '(SELECT 1 FROM live_sessions s WHERE s.user_id=u.id AND s.ended_at IS NULL '
-                'AND s.last_seen_at>? AND u.active=1 AND u.network_blocked=0) ORDER BY u.login',
-                (self.manager._user_id, now - RESPONSE_SECONDS)).fetchall()
+                '(SELECT MAX(COALESCE(p.last_heartbeat,s.last_seen_at)) FROM live_sessions s '
+                'LEFT JOIN lan_presence p ON p.session_id=s.id WHERE s.user_id=u.id) AS last_seen,'
+                'EXISTS(SELECT 1 FROM live_sessions s LEFT JOIN lan_presence p ON p.session_id=s.id '
+                'WHERE s.user_id=u.id AND s.ended_at IS NULL AND '
+                '((p.session_id IS NOT NULL AND p.last_heartbeat>?) OR '
+                '(p.session_id IS NULL AND s.last_seen_at>=?))) AS connected '
+                'FROM users u WHERE u.id<>? ORDER BY u.login',
+                (now - LAN_RESPONSE_SECONDS, now - RESPONSE_SECONDS, self.manager._user_id)).fetchall()
             result = []
             for row in users:
                 item = dict(row)
-                item['status'] = ('Заблокирован: нет ответа' if row['network_blocked'] else
-                                  'Деактивирован' if not row['active'] else
-                                  'Никогда не входил' if row['last_login'] is None else 'Нет подключения')
+                if not row['active']:
+                    item['status_code'], item['status'] = 'deactivated', 'Пользователь деактивирован'
+                elif row['network_blocked']:
+                    item['status_code'], item['status'] = 'offline', 'Нет подключения: заблокирован'
+                elif row['connected']:
+                    item['status_code'], item['status'] = 'online', 'Работает'
+                else:
+                    item['status_code'], item['status'] = 'offline', 'Нет подключения'
+                item.pop('connected')
+                presence = c.execute(
+                    'SELECT p.address,p.client_name FROM lan_presence p '
+                    'JOIN live_sessions s ON s.id=p.session_id WHERE s.user_id=? '
+                    'ORDER BY p.last_heartbeat DESC LIMIT 1', (row['id'],)).fetchone()
+                item['address'] = presence['address'] if presence else None
+                item['client_name'] = presence['client_name'] if presence else None
                 item['files'] = [dict(r) for r in c.execute(
                     "SELECT action,details,timestamp FROM audit_logs WHERE user_id=? "
                     "AND action IN ('FILE_OPEN','FILE_SAVE','FILE_CREATE','FILE_DELETE','FILE_RENAME',"
@@ -103,16 +123,29 @@ class ConnectivityMonitor:
                 result.append(item)
             return result
 
+    def offline_users(self):
+        """Совместимость с прежним окном: только аккаунты без подключения."""
+        return [row for row in self.user_statuses() if row['status_code'] != 'online']
+
     def unblock(self, user_id):
         with self.db.get_cursor() as c:
             c.execute('BEGIN IMMEDIATE')
             actor = self._actor(c, admin=True)
             if not actor:
                 raise PermissionError('Требуется действующий сеанс администратора')
-            c.execute('UPDATE users SET network_blocked=0,updated_at=CURRENT_TIMESTAMP '
-                      'WHERE id=? AND active=1 AND network_blocked=1', (user_id,))
-            if c.rowcount != 1:
+            target = c.execute('SELECT login,active,network_blocked FROM users WHERE id=?',
+                               (user_id,)).fetchone()
+            if target is None or (target['active'] and not target['network_blocked']):
                 return False
-            c.execute("INSERT INTO audit_logs(user_id,action,details) VALUES (?,'NETWORK_UNBLOCK',?)",
-                      (user_id, f'Администратор ID={actor["id"]}'))
+            if user_id == actor['id']:
+                return False
+            c.execute('UPDATE users SET active=1,network_blocked=0,updated_at=CURRENT_TIMESTAMP '
+                      'WHERE id=?', (user_id,))
+            c.execute('DELETE FROM login_attempts WHERE login=?', (target['login'],))
+            c.execute('DELETE FROM user_sessions WHERE user_id=?', (user_id,))
+            c.execute("UPDATE live_sessions SET ended_at=?,end_reason='reactivated' "
+                      'WHERE user_id=? AND ended_at IS NULL', (self.clock(), user_id))
+            action = 'REACTIVATE_USER' if not target['active'] else 'NETWORK_UNBLOCK'
+            c.execute('INSERT INTO audit_logs(user_id,action,details) VALUES (?,?,?)',
+                      (user_id, action, f'Администратор ID={actor["id"]}'))
             return True

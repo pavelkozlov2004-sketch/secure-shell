@@ -1,6 +1,8 @@
 """Headless report format shared by conversion, storage, and Qt rendering."""
 
-FORMAT = 'secure-shell-table-v1'
+FORMAT = 'vual-table-v1'
+# Импорт таблиц, сохранённых предыдущими выпусками приложения.
+LEGACY_FORMAT = 'secure-shell-table-v1'
 MAX_TABLE_BYTES = 1024 * 1024
 MAX_WIDGET_ROWS = 400
 COLUMNS = (
@@ -47,7 +49,7 @@ EXAMPLE_REPORT = {
 
 def validate_report(value):
     """Reject oversized or malformed input before constructing table widgets."""
-    if not isinstance(value, dict) or value.get('format') != FORMAT:
+    if not isinstance(value, dict) or value.get('format') not in (FORMAT, LEGACY_FORMAT):
         raise ValueError('Неподдерживаемый формат таблицы')
 
     def short_text(text, label):
@@ -88,4 +90,3 @@ def validate_report(value):
                 for cell in cells:
                     short_text(cell, 'ячейка')
     return value
-

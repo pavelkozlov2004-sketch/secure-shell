@@ -104,7 +104,7 @@ def convert_text(content, title, delimiter='auto'):
                 continue
             candidates.append(rows)
         if not candidates:
-            raise ValueError('Не удалось распознать таблицу: используйте JSON secure-shell-table-v1 '
+            raise ValueError('Не удалось распознать таблицу: используйте JSON vual-table-v1 '
                              'или CSV/TSV с 13 ячейками в каждой строке')
         if len(candidates) > 1:
             raise ValueError('Неоднозначный разделитель; выберите его явно')
@@ -145,6 +145,11 @@ class DocumentStorage:
                 (user.id, session_id)).fetchone()
             if actor is None:
                 raise PermissionError('Сеанс завершён или учётная запись заблокирована')
+            if getattr(self.login, 'is_remote', False) and (
+                    actor['direction_id'] != user.direction_id
+                    or actor['secrecy_level_id'] != user.secrecy_level_id
+                    or bool(actor['is_admin']) != user.is_admin):
+                raise PermissionError('Локальные права не соответствуют серверным. Обновите подключение.')
             if admin and not actor['is_admin']:
                 raise PermissionError('Доступ к исходным документам и изменению таблиц разрешён только администратору')
             yield cursor, actor, session_id

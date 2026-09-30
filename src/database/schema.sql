@@ -20,6 +20,7 @@ CREATE TABLE IF NOT EXISTS users (
     secrecy_level_id INTEGER NOT NULL,
     is_admin INTEGER DEFAULT 0,
     active INTEGER NOT NULL DEFAULT 1,
+    network_blocked INTEGER NOT NULL DEFAULT 0,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     FOREIGN KEY (direction_id) REFERENCES directions(id),
@@ -113,3 +114,30 @@ CREATE TABLE IF NOT EXISTS connectivity_challenges (
     nonce TEXT NOT NULL UNIQUE, issued_at REAL NOT NULL, deadline REAL NOT NULL,
     answered_at REAL, resolved_at REAL
 );
+
+-- Ревизия учётных данных изменяется в той же транзакции, что и аккаунт.
+-- Локальная ревизия отличается от последней полученной ревизии сервера.
+CREATE TABLE IF NOT EXISTS account_sync_state (
+    id INTEGER PRIMARY KEY CHECK(id=1),
+    revision INTEGER NOT NULL DEFAULT 0 CHECK(revision >= 0)
+);
+INSERT OR IGNORE INTO account_sync_state(id,revision) VALUES (1,0);
+CREATE TABLE IF NOT EXISTS lan_sync_state (
+    id INTEGER PRIMARY KEY CHECK(id=1),
+    revision INTEGER NOT NULL DEFAULT -1 CHECK(revision >= -1),
+    server_id TEXT
+);
+INSERT OR IGNORE INTO lan_sync_state(id,revision) VALUES (1,-1);
+CREATE TABLE IF NOT EXISTS server_identity (
+    id INTEGER PRIMARY KEY CHECK(id=1),
+    server_id TEXT NOT NULL UNIQUE
+);
+
+-- Только настоящий heartbeat по сети обновляет присутствие LAN-клиента.
+CREATE TABLE IF NOT EXISTS lan_presence (
+    session_id TEXT PRIMARY KEY REFERENCES live_sessions(id),
+    address TEXT,
+    client_name TEXT,
+    last_heartbeat REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_lan_presence_heartbeat ON lan_presence(last_heartbeat);

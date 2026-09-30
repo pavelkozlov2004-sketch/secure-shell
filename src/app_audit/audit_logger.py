@@ -13,7 +13,7 @@ class AuditLogger:
     @staticmethod
     def _setup_file_logger():
         path = Path(AUDIT_LOG_PATH).resolve()
-        logger = logging.getLogger('secure_shell.audit.' + str(path))
+        logger = logging.getLogger('vual.audit.' + str(path))
         logger.setLevel(logging.INFO)
         logger.propagate = False
         if not logger.handlers:

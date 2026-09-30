@@ -71,15 +71,15 @@ class LoginWindowTests(unittest.TestCase):
         self.assertFalse(board.isVisible())
         self.assertEqual(board.table.rowCount(), 0)
 
-    def test_connectivity_board_ten_minute_schedule(self):
+    def test_connectivity_board_two_second_schedule(self):
         self.setup_admin()
         with patch('ui.login_window.time.monotonic', return_value=100):
             self.login()
-        self.assertEqual(self.window._next_board, 700)
-        with patch('ui.login_window.time.monotonic', return_value=699), patch.object(self.window, '_show_connections') as show:
+        self.assertEqual(self.window._next_board, 102)
+        with patch('ui.login_window.time.monotonic', return_value=101), patch.object(self.window, '_show_connections') as show:
             self.window._refresh_session()
             show.assert_not_called()
-        with patch('ui.login_window.time.monotonic', return_value=700), patch.object(self.window, '_show_connections') as show:
+        with patch('ui.login_window.time.monotonic', return_value=102), patch.object(self.window, '_show_connections') as show:
             self.window._refresh_session()
             show.assert_called_once_with(automatic=True)
 
