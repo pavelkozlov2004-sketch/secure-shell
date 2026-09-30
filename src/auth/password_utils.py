@@ -1,53 +1,35 @@
-"""Утилиты для работы с паролями"""
-
+"""Пароли PBKDF2; старые SHA-256 поддерживаются для миграции при входе."""
 import hashlib
+import hmac
 import secrets
-from typing import Tuple
 
 
 class PasswordUtils:
-    """Утилиты для хеширования и проверки паролей"""
-    
+    ITERATIONS = 600_000
+
     @staticmethod
-    def hash_password(password: str) -> Tuple[str, str]:
-        """Хеширует пароль с солью SHA-256
-        
-        Args:
-            password: исходный пароль
-            
-        Returns:
-            Кортеж (хеш, соль)
-        """
-        salt = secrets.token_hex(16)  # 32-символьная соль
-        hash_obj = hashlib.sha256((password + salt).encode('utf-8'))
-        return hash_obj.hexdigest(), salt
-    
+    def hash_password(password):
+        salt = secrets.token_hex(16)
+        digest = hashlib.pbkdf2_hmac('sha256', password.encode(), salt.encode(),
+                                     PasswordUtils.ITERATIONS).hex()
+        return f'pbkdf2_sha256:{PasswordUtils.ITERATIONS}:{digest}', salt
+
     @staticmethod
-    def verify_password(password: str, hash_value: str, salt: str) -> bool:
-        """Проверяет пароль против хеша
-        
-        Args:
-            password: пароль для проверки
-            hash_value: сохранённый хеш
-            salt: сохранённая соль
-            
-        Returns:
-            True если пароль верный, иначе False
-        """
-        hash_obj = hashlib.sha256((password + salt).encode('utf-8'))
-        return hash_obj.hexdigest() == hash_value
-    
-    @staticmethod
-    def is_valid_password(password: str) -> bool:
-        """Проверяет, соответствует ли пароль требованиям
-        
-        Args:
-            password: пароль для проверки
-            
-        Returns:
-            True если пароль валидный
-        """
-        # Минимум 8 символов
-        if len(password) < 8:
+    def verify_password(password, hash_value, salt):
+        try:
+            if hash_value.startswith('pbkdf2_sha256:'):
+                _, rounds, expected = hash_value.split(':')
+                rounds = int(rounds)
+                if not 100_000 <= rounds <= 2_000_000:
+                    return False
+                actual = hashlib.pbkdf2_hmac('sha256', password.encode(), salt.encode(), rounds).hex()
+            else:
+                expected = hash_value
+                actual = hashlib.sha256((password + salt).encode()).hexdigest()
+            return hmac.compare_digest(actual, expected)
+        except (ValueError, TypeError, AttributeError):
             return False
-        return True
+
+    @staticmethod
+    def is_valid_password(password):
+        return isinstance(password, str) and 8 <= len(password) <= 1024

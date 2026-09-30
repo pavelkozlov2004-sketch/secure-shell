@@ -19,6 +19,7 @@ CREATE TABLE IF NOT EXISTS users (
     direction_id INTEGER NOT NULL,
     secrecy_level_id INTEGER NOT NULL,
     is_admin INTEGER DEFAULT 0,
+    active INTEGER NOT NULL DEFAULT 1,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     FOREIGN KEY (direction_id) REFERENCES directions(id),
@@ -68,3 +69,47 @@ CREATE INDEX IF NOT EXISTS idx_files_metadata_direction ON files_metadata(direct
 CREATE INDEX IF NOT EXISTS idx_files_metadata_secrecy ON files_metadata(secrecy_level_id);
 CREATE INDEX IF NOT EXISTS idx_audit_logs_user ON audit_logs(user_id);
 CREATE INDEX IF NOT EXISTS idx_audit_logs_timestamp ON audit_logs(timestamp);
+
+-- Счётчики сохраняются между перезапусками приложения.
+CREATE TABLE IF NOT EXISTS login_attempts (
+    login TEXT PRIMARY KEY, failures INTEGER NOT NULL DEFAULT 0,
+    locked_until REAL NOT NULL DEFAULT 0
+);
+
+CREATE TABLE IF NOT EXISTS live_sessions (
+    id TEXT PRIMARY KEY,
+    user_id INTEGER NOT NULL REFERENCES users(id),
+    started_at REAL NOT NULL,
+    last_seen_at REAL NOT NULL,
+    ended_at REAL,
+    end_reason TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_live_sessions_user ON live_sessions(user_id, ended_at);
+CREATE TABLE IF NOT EXISTS emergency_credentials (
+    user_id INTEGER PRIMARY KEY REFERENCES users(id),
+    login TEXT NOT NULL,
+    password_hash TEXT NOT NULL,
+    batch_id TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS emergency_state (
+    id INTEGER PRIMARY KEY CHECK(id=1),
+    batch_id TEXT NOT NULL,
+    prepared_at REAL NOT NULL,
+    consumed_at REAL
+);
+CREATE TABLE IF NOT EXISTS emergency_reports (
+    id TEXT PRIMARY KEY,
+    created_at REAL NOT NULL,
+    actor_id INTEGER NOT NULL REFERENCES users(id),
+    report_json TEXT NOT NULL
+);
+
+-- Administrative challenge/response monitor (shared database).
+CREATE TABLE IF NOT EXISTS connectivity_schedule (
+    id INTEGER PRIMARY KEY CHECK(id=1), next_poll REAL NOT NULL
+);
+CREATE TABLE IF NOT EXISTS connectivity_challenges (
+    session_id TEXT PRIMARY KEY REFERENCES live_sessions(id),
+    nonce TEXT NOT NULL UNIQUE, issued_at REAL NOT NULL, deadline REAL NOT NULL,
+    answered_at REAL, resolved_at REAL
+);

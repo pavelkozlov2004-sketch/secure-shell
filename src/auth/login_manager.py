@@ -1,290 +1,244 @@
-"""Менеджер авторизации и управления пользователями"""
-
+"""Авторизация, блокировка попыток и управление актуальными правами."""
 import sqlite3
-from typing import Optional, Dict, Any, List
-from dataclasses import dataclass
-
-from database.db_manager import DatabaseManager
+import time
+import uuid
+import sys
+from dataclasses import dataclass, asdict
 from auth.password_utils import PasswordUtils
-from logging.audit_logger import AuditLogger
+from app_audit.audit_logger import AuditLogger
+from config import MAX_LOGIN_ATTEMPTS, LOCK_TIMEOUT
 
 
-@dataclass
+@dataclass(frozen=True)
 class User:
-    """Класс для представления пользователя"""
     id: int
     login: str
     direction_id: int
     secrecy_level_id: int
     is_admin: bool
-    
-    def to_dict(self) -> Dict[str, Any]:
-        """Преобразует пользователя в словарь"""
-        return {
-            'id': self.id,
-            'login': self.login,
-            'direction_id': self.direction_id,
-            'secrecy_level_id': self.secrecy_level_id,
-            'is_admin': self.is_admin
-        }
+
+    def to_dict(self):
+        return asdict(self)
 
 
 class LoginManager:
-    """Менеджер для авторизации и управления пользователями"""
-    
-    def __init__(self, db_manager: DatabaseManager):
+    def __init__(self, db_manager):
         self.db = db_manager
-        self.current_user: Optional[User] = None
+        self._user_id = None
+        self._session_id = None
         self.audit_logger = AuditLogger(db_manager)
-    
-    def register_user(self, login: str, password: str, direction_id: int,
-                     secrecy_level_id: int, is_admin: bool = False) -> bool:
-        """Регистрирует нового пользователя
-        
-        Args:
-            login: логин пользователя
-            password: пароль
-            direction_id: ID направления
-            secrecy_level_id: ID уровня секретности
-            is_admin: администратор ли
-            
-        Returns:
-            True если пользователь создан, иначе False
-        """
-        try:
-            if not PasswordUtils.is_valid_password(password):
-                return False
-            
-            password_hash, salt = PasswordUtils.hash_password(password)
-            stored_hash = f"{password_hash}${salt}"
-            
-            self.db.execute(
-                '''INSERT INTO users 
-                   (login, password_hash, direction_id, secrecy_level_id, is_admin)
-                   VALUES (?, ?, ?, ?, ?)''',
-                (login, stored_hash, direction_id, secrecy_level_id, int(is_admin))
-            )
-            return True
-            
-        except sqlite3.IntegrityError:
-            # Пользователь с таким логином уже существует
-            return False
-    
-    def login(self, login: str, password: str) -> bool:
-        """Авторизует пользователя
-        
-        Args:
-            login: логин
-            password: пароль
-            
-        Returns:
-            True если авторизация успешна, иначе False
-        """
-        user_row = self.db.fetch_one(
-            '''SELECT id, login, password_hash, direction_id, secrecy_level_id, is_admin
-               FROM users WHERE login = ?''',
-            (login,)
-        )
-        
-        if not user_row:
-            return False
-        
-        user_id, username, stored_hash, direction_id, level_id, is_admin = user_row
-        
-        try:
-            hash_value, salt = stored_hash.split('$')
-        except ValueError:
-            return False
-        
-        if PasswordUtils.verify_password(password, hash_value, salt):
-            self.current_user = User(
-                id=user_id,
-                login=username,
-                direction_id=direction_id,
-                secrecy_level_id=level_id,
-                is_admin=bool(is_admin)
-            )
-            self.audit_logger.log_login(user_id)
-            return True
-        
-        return False
-    
-    def logout(self):
-        """Завершает текущий сеанс"""
-        if self.current_user:
-            self.audit_logger.log_logout(self.current_user.id)
-            self.current_user = None
-    
-    def get_current_user(self) -> Optional[User]:
-        """Возвращает текущего авторизованного пользователя"""
+
+    @property
+    def current_user(self):
+        if self._user_id is None or self._session_id is None:
+            return None
+        session = self.db.fetch_one(
+            'SELECT 1 FROM live_sessions s JOIN users u ON u.id=s.user_id '
+            'WHERE s.id=? AND s.user_id=? AND s.ended_at IS NULL AND u.active=1 AND u.network_blocked=0',
+            (self._session_id, self._user_id))
+        if not session:
+            self._user_id = self._session_id = None
+            self.audit_logger.session_id = None
+            return None
+        self.db.execute('UPDATE live_sessions SET last_seen_at=? WHERE id=? AND ended_at IS NULL',
+                        (time.time(), self._session_id))
+        return self.get_user_by_id(self._user_id)
+
+    def get_current_user(self):
         return self.current_user
-    
-    def is_logged_in(self) -> bool:
-        """Проверяет, авторизован ли пользователь"""
+
+    def is_logged_in(self):
         return self.current_user is not None
-    
-    def change_password(self, user_id: int, old_password: str, new_password: str) -> bool:
-        """Меняет пароль пользователя
-        
-        Args:
-            user_id: ID пользователя
-            old_password: старый пароль
-            new_password: новый пароль
-            
-        Returns:
-            True если пароль изменён, иначе False
-        """
-        user_row = self.db.fetch_one(
-            'SELECT login, password_hash FROM users WHERE id = ?',
-            (user_id,)
-        )
-        
-        if not user_row:
+
+    def _admin(self):
+        user = self.current_user
+        return user if user and user.is_admin else None
+
+    def _transaction_user(self, cursor, *, admin=False):
+        """Проверить сеанс внутри транзакции, не фиксируя её heartbeat-записью."""
+        row = cursor.execute(
+            'SELECT u.id,u.login,u.direction_id,u.secrecy_level_id,u.is_admin '
+            'FROM users u JOIN live_sessions s ON s.user_id=u.id '
+            'WHERE u.id=? AND s.id=? AND s.ended_at IS NULL '
+            'AND u.active=1 AND u.network_blocked=0',
+            (self._user_id, self._session_id)).fetchone()
+        return row if row and (not admin or row['is_admin']) else None
+
+    def register_user(self, login, password, direction_id, secrecy_level_id, is_admin=False):
+        actor = self._admin()
+        if not actor or not isinstance(login, str) or not login.strip() or not PasswordUtils.is_valid_password(password):
             return False
-        
-        login, stored_hash = user_row
-        
+        digest, salt = PasswordUtils.hash_password(password)
         try:
-            hash_value, salt = stored_hash.split('$')
-        except ValueError:
+            with self.db.get_cursor() as cursor:
+                cursor.execute('BEGIN IMMEDIATE')
+                authorized = self._transaction_user(cursor, admin=True)
+                if not authorized or authorized['id'] != actor.id:
+                    return False
+                cursor.execute('INSERT INTO users(login,password_hash,direction_id,secrecy_level_id,is_admin) VALUES (?,?,?,?,?)',
+                               (login.strip(), f'{digest}${salt}', direction_id, secrecy_level_id, int(is_admin)))
+        except sqlite3.IntegrityError:
             return False
-        
-        # Проверяем старый пароль
-        if not PasswordUtils.verify_password(old_password, hash_value, salt):
-            return False
-        
-        # Проверяем новый пароль
-        if not PasswordUtils.is_valid_password(new_password):
-            return False
-        
-        # Хешируем новый пароль
-        new_hash, new_salt = PasswordUtils.hash_password(new_password)
-        new_stored_hash = f"{new_hash}${new_salt}"
-        
-        self.db.execute(
-            'UPDATE users SET password_hash = ? WHERE id = ?',
-            (new_stored_hash, user_id)
-        )
-        
-        self.audit_logger.log_action(user_id, 'CHANGE_PASSWORD', 'Пользователь изменил пароль')
+        self.audit_logger.log_action(actor.id, 'CREATE_USER', login.strip())
         return True
-    
-    def reset_password(self, user_id: int, new_password: str) -> bool:
-        """Сбрасывает пароль пользователя (для администратора)
-        
-        Args:
-            user_id: ID пользователя
-            new_password: новый пароль
-            
-        Returns:
-            True если пароль сброшен
-        """
-        if not self.current_user or not self.current_user.is_admin:
+
+    def login(self, login, password):
+        self.logout()
+        if not isinstance(login, str) or not isinstance(password, str) or len(password) > 1024:
             return False
-        
-        if not PasswordUtils.is_valid_password(new_password):
-            return False
-        
-        new_hash, new_salt = PasswordUtils.hash_password(new_password)
-        new_stored_hash = f"{new_hash}${new_salt}"
-        
-        self.db.execute(
-            'UPDATE users SET password_hash = ? WHERE id = ?',
-            (new_stored_hash, user_id)
-        )
-        
-        self.audit_logger.log_action(
-            self.current_user.id,
-            'RESET_PASSWORD',
-            f'Администратор сбросил пароль пользователю ID={user_id}'
-        )
-        return True
-    
-    def get_user_by_id(self, user_id: int) -> Optional[User]:
-        """Получает пользователя по ID"""
-        user_row = self.db.fetch_one(
-            'SELECT id, login, direction_id, secrecy_level_id, is_admin FROM users WHERE id = ?',
-            (user_id,)
-        )
-        
-        if user_row:
-            return User(
-                id=user_row[0],
-                login=user_row[1],
-                direction_id=user_row[2],
-                secrecy_level_id=user_row[3],
-                is_admin=bool(user_row[4])
-            )
-        return None
-    
-    def get_all_users(self) -> List[User]:
-        """Получает список всех пользователей (для администратора)"""
-        if not self.current_user or not self.current_user.is_admin:
+        now = time.time()
+        # Транзакция сериализует счётчик между экземплярами приложения.
+        with self.db.get_cursor() as cursor:
+            cursor.execute('BEGIN IMMEDIATE')
+            attempt = cursor.execute('SELECT failures,locked_until FROM login_attempts WHERE login=?', (login,)).fetchone()
+            locked = bool(attempt and attempt['locked_until'] > now)
+            row = cursor.execute('SELECT * FROM users WHERE login=?', (login,)).fetchone()
+            success = False
+            if not locked and row and row['active'] and not row['network_blocked']:
+                try:
+                    digest, salt = row['password_hash'].split('$')
+                    success = PasswordUtils.verify_password(password, digest, salt)
+                except (ValueError, AttributeError):
+                    pass
+            if success:
+                session_id = uuid.uuid4().hex
+                cursor.execute('INSERT INTO live_sessions(id,user_id,started_at,last_seen_at) VALUES (?,?,?,?)',
+                               (session_id, row['id'], now, now))
+                cursor.execute('DELETE FROM login_attempts WHERE login=?', (login,))
+                if not digest.startswith('pbkdf2_sha256:'):
+                    digest, salt = PasswordUtils.hash_password(password)
+                    cursor.execute('UPDATE users SET password_hash=? WHERE id=?', (f'{digest}${salt}', row['id']))
+            elif not locked:
+                failures = (attempt['failures'] if attempt and not attempt['locked_until'] else 0) + 1
+                until = now + LOCK_TIMEOUT if failures >= MAX_LOGIN_ATTEMPTS else 0
+                cursor.execute('INSERT INTO login_attempts(login,failures,locked_until) VALUES (?,?,?) '
+                               'ON CONFLICT(login) DO UPDATE SET failures=excluded.failures,locked_until=excluded.locked_until',
+                               (login, failures, until))
+        if success:
+            self._user_id = row['id']
+            self._session_id = session_id
+            self.audit_logger.session_id = session_id
+            self.audit_logger.log_login(self._user_id)
+            self.audit_logger.log_action(self._user_id, 'SESSION_PROCESS',
+                'Исполняемый файл приложения, обслуживающего сеанс', executable_path=sys.executable)
+        else:
+            self.audit_logger.log_action(row['id'] if row else None,
+                                         'LOGIN_LOCKED' if locked else 'LOGIN_FAILED', login)
+        return success
+
+    def logout(self):
+        user_id, session_id = self._user_id, self._session_id
+        self._user_id = self._session_id = None
+        try:
+            if session_id is not None:
+                ended = self.db.execute(
+                    "UPDATE live_sessions SET ended_at=?,end_reason='logout' WHERE id=? AND ended_at IS NULL",
+                    (time.time(), session_id)).rowcount
+                if ended and user_id is not None:
+                    self.audit_logger.log_logout(user_id)
+        finally:
+            self.audit_logger.session_id = None
+
+    def get_user_by_id(self, user_id):
+        row = self.db.fetch_one('SELECT id,login,direction_id,secrecy_level_id,is_admin FROM users WHERE id=? AND active=1', (user_id,))
+        return User(row['id'], row['login'], row['direction_id'], row['secrecy_level_id'], bool(row['is_admin'])) if row else None
+
+    def get_all_users(self):
+        if not self._admin():
             return []
-        
-        users_rows = self.db.fetch_all(
-            'SELECT id, login, direction_id, secrecy_level_id, is_admin FROM users'
-        )
-        
-        return [
-            User(
-                id=row[0],
-                login=row[1],
-                direction_id=row[2],
-                secrecy_level_id=row[3],
-                is_admin=bool(row[4])
-            )
-            for row in users_rows
-        ]
-    
-    def delete_user(self, user_id: int) -> bool:
-        """Удаляет пользователя (для администратора)"""
-        if not self.current_user or not self.current_user.is_admin:
+        with self.db.get_cursor() as cursor:
+            cursor.execute('BEGIN IMMEDIATE')
+            if not self._transaction_user(cursor, admin=True):
+                return []
+            rows = cursor.execute(
+                'SELECT id,login,direction_id,secrecy_level_id,is_admin FROM users WHERE active=1 ORDER BY id').fetchall()
+            return [User(r['id'], r['login'], r['direction_id'], r['secrecy_level_id'], bool(r['is_admin'])) for r in rows]
+
+    def change_password(self, user_id, old_password, new_password):
+        user = self.current_user
+        if not user or user.id != user_id or not PasswordUtils.is_valid_password(new_password):
             return False
-        
-        if user_id == self.current_user.id:
-            # Нельзя удалить себя
+        row = self.db.fetch_one('SELECT password_hash FROM users WHERE id=?', (user_id,))
+        try:
+            digest, salt = row['password_hash'].split('$')
+        except (ValueError, TypeError):
             return False
-        
-        self.db.execute('DELETE FROM users WHERE id = ?', (user_id,))
-        self.audit_logger.log_action(
-            self.current_user.id,
-            'DELETE_USER',
-            f'Администратор удалил пользователя ID={user_id}'
-        )
+        if not PasswordUtils.verify_password(old_password, digest, salt):
+            return False
+        digest, salt = PasswordUtils.hash_password(new_password)
+        with self.db.get_cursor() as cursor:
+            cursor.execute('BEGIN IMMEDIATE')
+            authorized = self._transaction_user(cursor)
+            if not authorized or authorized['id'] != user_id:
+                return False
+            cursor.execute('UPDATE users SET password_hash=?,updated_at=CURRENT_TIMESTAMP '
+                           'WHERE id=? AND password_hash=?', (f'{digest}${salt}', user_id, row['password_hash']))
+            if cursor.rowcount != 1:
+                return False
+        self.audit_logger.log_action(user.id, 'CHANGE_PASSWORD')
         return True
-    
-    def update_user(self, user_id: int, direction_id: int = None,
-                   secrecy_level_id: int = None, is_admin: bool = None) -> bool:
-        """Обновляет параметры пользователя (для администратора)"""
-        if not self.current_user or not self.current_user.is_admin:
+
+    def reset_password(self, user_id, new_password):
+        actor = self._admin()
+        target = self.get_user_by_id(user_id)
+        if not actor or not target or not PasswordUtils.is_valid_password(new_password):
             return False
-        
-        updates = []
-        params = []
-        
-        if direction_id is not None:
-            updates.append('direction_id = ?')
-            params.append(direction_id)
-        
-        if secrecy_level_id is not None:
-            updates.append('secrecy_level_id = ?')
-            params.append(secrecy_level_id)
-        
-        if is_admin is not None:
-            updates.append('is_admin = ?')
-            params.append(int(is_admin))
-        
-        if not updates:
+        digest, salt = PasswordUtils.hash_password(new_password)
+        with self.db.get_cursor() as c:
+            c.execute('BEGIN IMMEDIATE')
+            authorized = self._transaction_user(c, admin=True)
+            if not authorized or authorized['id'] != actor.id:
+                return False
+            c.execute('UPDATE users SET password_hash=?,updated_at=CURRENT_TIMESTAMP WHERE id=? AND active=1', (f'{digest}${salt}', user_id))
+            if c.rowcount != 1:
+                return False
+            c.execute('DELETE FROM login_attempts WHERE login=?', (target.login,))
+        self.audit_logger.log_action(actor.id, 'RESET_PASSWORD', f'ID={user_id}')
+        return True
+
+    def delete_user(self, user_id):
+        """Деактивация сохраняет владельцев документов и историю аудита."""
+        actor = self._admin()
+        if not actor or user_id == actor.id:
             return False
-        
-        params.append(user_id)
-        query = f"UPDATE users SET {', '.join(updates)} WHERE id = ?"
-        
-        self.db.execute(query, tuple(params))
-        self.audit_logger.log_action(
-            self.current_user.id,
-            'UPDATE_USER',
-            f'Администратор обновил пользователя ID={user_id}'
-        )
+        with self.db.get_cursor() as c:
+            c.execute('BEGIN IMMEDIATE')
+            authorized = self._transaction_user(c, admin=True)
+            if not authorized or authorized['id'] != actor.id:
+                return False
+            c.execute('UPDATE users SET active=0,updated_at=CURRENT_TIMESTAMP WHERE id=? AND active=1', (user_id,))
+            if c.rowcount != 1:
+                return False
+            c.execute('DELETE FROM user_sessions WHERE user_id=?', (user_id,))
+            c.execute("UPDATE live_sessions SET ended_at=?,end_reason='deactivated' WHERE user_id=? AND ended_at IS NULL", (time.time(), user_id))
+        self.audit_logger.log_action(actor.id, 'DEACTIVATE_USER', f'ID={user_id}')
+        return True
+
+    def update_user(self, user_id, direction_id=None, secrecy_level_id=None, is_admin=None):
+        actor = self._admin()
+        if not actor:
+            return False
+        changes = {k: v for k, v in dict(direction_id=direction_id, secrecy_level_id=secrecy_level_id,
+                                         is_admin=None if is_admin is None else int(is_admin)).items() if v is not None}
+        if not changes:
+            return False
+        try:
+            with self.db.get_cursor() as c:
+                c.execute('BEGIN IMMEDIATE')
+                authorized = self._transaction_user(c, admin=True)
+                if not authorized or authorized['id'] != actor.id:
+                    return False
+                target = c.execute('SELECT is_admin FROM users WHERE id=? AND active=1', (user_id,)).fetchone()
+                if not target:
+                    return False
+                if target['is_admin'] and changes.get('is_admin') == 0:
+                    if c.execute('SELECT count(*) FROM users WHERE active=1 AND is_admin=1').fetchone()[0] <= 1:
+                        return False
+                c.execute('UPDATE users SET ' + ','.join(k+'=?' for k in changes) +
+                          ',updated_at=CURRENT_TIMESTAMP WHERE id=? AND active=1', (*changes.values(), user_id))
+                if c.rowcount != 1:
+                    return False
+        except sqlite3.IntegrityError:
+            return False
+        self.audit_logger.log_action(actor.id, 'UPDATE_USER', f'ID={user_id}')
         return True

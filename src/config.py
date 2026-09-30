@@ -6,16 +6,19 @@ from enum import Enum
 
 # Пути
 BASE_DIR = Path(__file__).parent.parent
-DATA_DIR = BASE_DIR / "data"
+DATA_DIR = Path(os.environ.get("SECURE_SHELL_DATA_DIR", str(Path.home() / ".secure-shell"))).expanduser().resolve()
 RESOURCES_DIR = BASE_DIR / "resources"
 LOGS_DIR = DATA_DIR / "logs"
 
 # Создание директорий если их нет
-DATA_DIR.mkdir(exist_ok=True)
+DATA_DIR.mkdir(parents=True, exist_ok=True)
 LOGS_DIR.mkdir(exist_ok=True)
 
 # База данных
-DB_PATH = DATA_DIR / "secure_shell.db"
+DB_PATH = DATA_DIR / "users.db"
+TABLES_DB_PATH = DATA_DIR / "tables.db"
+DOCUMENTS_DB_PATH = DATA_DIR / "documents.db"
+LEGACY_DB_PATH = DATA_DIR / "secure_shell.db"
 
 # Логирование
 AUDIT_LOG_PATH = DATA_DIR / "audit.log"
@@ -52,7 +55,7 @@ class SecrecyLevel(Enum):
 # Учётные данные администратора по умолчанию
 DEFAULT_ADMIN = {
     "login": "admin_admin",
-    "password": "12345678",
+    "password": None,  # Задаётся при первоначальной настройке
     "direction": Direction.NORTH,
     "secrecy_level": SecrecyLevel.TOP_SECRET,
 }

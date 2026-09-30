@@ -1,73 +1,44 @@
-"""Проверка прав доступа к ресурсам"""
+"""Проверка текущих прав и порядка уровней из справочника БД."""
+import os
+from pathlib import Path
 
-from typing import List, Optional
 
-from database.db_manager import DatabaseManager
-from auth.login_manager import User
+def canonical_path(path):
+    path = Path(os.path.abspath(os.fspath(path)))
+    # Не позволяем заменить разрешённый путь ссылкой на другой объект.
+    for part in (path, *path.parents):
+        if part.is_symlink() or (hasattr(part, 'is_junction') and part.is_junction()):
+            raise PermissionError('Символические ссылки и junction не поддерживаются')
+    return os.path.normcase(str(path))
 
 
 class PermissionManager:
-    """Менеджер для проверки прав доступа"""
-    
-    def __init__(self, db_manager: DatabaseManager):
+    def __init__(self, db_manager):
         self.db = db_manager
-    
-    def can_access_file(self, user: User, file_path: str) -> bool:
-        """Проверяет, может ли пользователь получить доступ к файлу
-        
-        Args:
-            user: объект пользователя
-            file_path: путь к файлу
-            
-        Returns:
-            True если есть доступ, иначе False
-        """
-        file_meta = self._get_file_metadata(file_path)
-        
-        if not file_meta:
-            # Если метаданные не найдены, отказываем в доступе
+
+    def _get_file_metadata(self, file_path):
+        return self.db.fetch_dict('SELECT * FROM files_metadata WHERE path=?', (canonical_path(file_path),))
+
+    def can_access_file(self, user, file_path):
+        if user is None:
             return False
-        
-        # Проверка по направлению
-        if user.direction_id != file_meta['direction_id']:
+        try:
+            path = canonical_path(file_path)
+        except (OSError, ValueError, PermissionError):
             return False
-        
-        # Проверка по уровню секретности
-        # Пользователь может видеть файлы своего уровня и ниже
-        if user.secrecy_level_id < file_meta['secrecy_level_id']:
-            return False
-        
-        return True
-    
-    def can_write_file(self, user: User, file_path: str) -> bool:
-        """Проверяет, может ли пользователь писать в файл"""
+        row = self.db.fetch_one('''SELECT u.direction_id AS ud, f.direction_id AS fd,
+                   ul.level_order AS ulevel, fl.level_order AS flevel
+            FROM users u JOIN secrecy_levels ul ON ul.id=u.secrecy_level_id
+            JOIN files_metadata f ON f.path=?
+            JOIN secrecy_levels fl ON fl.id=f.secrecy_level_id
+            WHERE u.id=? AND u.active=1''', (path, user.id))
+        return bool(row and row['ud'] == row['fd'] and row['ulevel'] >= row['flevel'])
+
+    def can_write_file(self, user, file_path):
         return self.can_access_file(user, file_path)
-    
-    def can_delete_file(self, user: User, file_path: str) -> bool:
-        """Проверяет, может ли пользователь удалить файл"""
+
+    def can_delete_file(self, user, file_path):
         return self.can_access_file(user, file_path)
-    
-    def filter_files(self, user: User, file_paths: List[str]) -> List[str]:
-        """Фильтрует список файлов по правам пользователя
-        
-        Args:
-            user: объект пользователя
-            file_paths: список путей к файлам
-            
-        Returns:
-            Отфильтрованный список файлов
-        """
-        return [f for f in file_paths if self.can_access_file(user, f)]
-    
-    def _get_file_metadata(self, file_path: str) -> Optional[dict]:
-        """Получает метаданные файла из БД"""
-        meta = self.db.fetch_one(
-            'SELECT direction_id, secrecy_level_id FROM files_metadata WHERE path = ?',
-            (file_path,)
-        )
-        if meta:
-            return {
-                'direction_id': meta[0],
-                'secrecy_level_id': meta[1]
-            }
-        return None
+
+    def filter_files(self, user, file_paths):
+        return [p for p in file_paths if self.can_access_file(user, p)]
